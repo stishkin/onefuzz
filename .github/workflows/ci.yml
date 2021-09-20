@@ -400,7 +400,7 @@ jobs:
         name: integration-test-artifacts
         path: src/integration-tests/artifacts
   build-integration-tests-windows:
-    runs-on: windows-2022
+    runs-on: windows-latest
     steps:
     - uses: actions/checkout@v2
     - run: |
