@@ -1,6 +1,6 @@
 CC=clang
 
-CFLAGS=-g3 -fsanitize=fuzzer -fsanitize=address
+CFLAGS=-g3 -fsanitize=fuzzer -fsanitize=address -v
 
 all: fuzz.exe
 
