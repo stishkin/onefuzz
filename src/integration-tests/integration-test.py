@@ -37,11 +37,6 @@ from onefuzztypes.models import Job, Pool, Repro, Scaleset, Task
 from onefuzztypes.primitives import Container, Directory, File, PoolName, Region
 from pydantic import BaseModel, Field
 
-LINUX_POOL = "linux-test"
-WINDOWS_POOL = "linux-test"
-BUILD = "0"
-
-
 class TaskTestState(Enum):
     not_running = "not_running"
     running = "running"
@@ -70,12 +65,14 @@ class Integration(BaseModel):
     use_setup: bool = Field(default=False)
     nested_setup_dir: Optional[str]
     wait_for_files: Dict[ContainerType, int]
+    wait_for_files_upgrade: Optional[Dict[ContainerType, int]]
     check_asan_log: Optional[bool] = Field(default=False)
     disable_check_debugger: Optional[bool] = Field(default=False)
     reboot_after_setup: Optional[bool] = Field(default=False)
     test_repro: Optional[bool] = Field(default=True)
     target_options: Optional[List[str]]
     inject_fake_regression: bool = Field(default=False)
+    colocate_all_tasks: bool = Field(default=False)
 
 
 TARGETS: Dict[str, Integration] = {
@@ -258,17 +255,34 @@ def retry(
             time.sleep(wait_duration)
 
 
+def retry_on_500(operation_name: str, op_lambda: Callable[[Any], OperationResult],) -> OperationResult:
+    for attempts in range(3):
+        try:
+            return op_lambda()
+        except Exception as err:
+            err_str = str(err)
+            if (
+                "request did not succeed: HTTP 500 -"
+            ) in err_str and attempts < 3:
+                self.logger.info(f"got 500 when {operation_name}, attempting again")
+                time.sleep(1)
+            else:
+                raise
+
+
+
 class TestOnefuzz:
     def __init__(
-        self, onefuzz: Onefuzz, logger: logging.Logger, test_id: UUID, polling_period=30
+        self, onefuzz: Onefuzz, logger: logging.Logger, test_id: UUID, build_id: str="0", polling_period=30
     ) -> None:
         self.of = onefuzz
         self.logger = logger
         self.test_id = test_id
-        self.project = f"test-{self.test_id}"
+        self.project = f"test-{self.test_id}-{build_id}"
         self.start_log_marker = f"integration-test-injection-error-start-{self.test_id}"
         self.stop_log_marker = f"integration-test-injection-error-stop-{self.test_id}"
         self.polling_period = polling_period
+        self.build_id = build_id
 
     def setup(
         self,
@@ -278,17 +292,30 @@ class TestOnefuzz:
         os_list: List[OS],
     ) -> None:
         def try_info_get(data: Any) -> None:
-            self.of.info.get()
+            return retry_on_500("getting os info", lambda: self.of.info.get())
 
         retry(try_info_get, "testing endpoint")
+        pool_list = retry_on_500("getting pool list", lambda: self.of.pools.list())
 
-        self.inject_log(self.start_log_marker)
+        existing_pool_names = [] 
+        for pool in pool_list:
+            existing_pool_names.append(pool.name)
+
         for entry in os_list:
             name = PoolName(f"testpool-{entry.name}-{self.test_id}")
-            self.logger.info("creating pool: %s:%s", entry.name, name)
-            self.of.pools.create(name, entry)
-            self.logger.info("creating scaleset for pool: %s", name)
-            self.of.scalesets.create(name, pool_size, region=region)
+            if name in existing_pool_names:
+                self.logger.info("using existing pool: %s:%s", entry.name, name)
+            else:
+                self.logger.info("creating pool: %s:%s", entry.name, name)
+                retry_on_500("create pools", lambda: self.of.pools.create(name, entry))
+                self.logger.info("creating scaleset for pool: %s", name)
+                retry_on_500("create scalesets", lambda: self.of.scalesets.create(name, pool_size, region=region))
+
+    def inject_start_log_marker(self):
+        self.inject_log(self.start_log_marker)
+
+    def inject_stop_log_marker(self):
+        self.inject_log(self.stop_log_marker)
 
     def launch(
         self, path: Directory, *, os_list: List[OS], targets: List[str], duration=int
@@ -296,7 +323,8 @@ class TestOnefuzz:
         """Launch all of the fuzzing templates"""
 
         pools = {}
-        for pool in self.of.pools.list():
+        pools_list = retry_on_500("list pools", lambda: self.of.pools.list())
+        for pool in pools_list:
             pools[pool.os] = pool
 
         job_ids = []
@@ -324,80 +352,86 @@ class TestOnefuzz:
             if setup and config.nested_setup_dir:
                 setup = Directory(os.path.join(setup, config.nested_setup_dir))
 
-            job: Optional[Job] = None
-            if config.template == TemplateType.libfuzzer:
-                job = self.of.template.libfuzzer.basic(
-                    self.project,
-                    target,
-                    BUILD,
-                    pools[config.os].name,
-                    target_exe=target_exe,
-                    inputs=inputs,
-                    setup_dir=setup,
-                    duration=duration,
-                    vm_count=1,
-                    reboot_after_setup=config.reboot_after_setup or False,
-                    target_options=config.target_options,
-                )
-            elif config.template == TemplateType.libfuzzer_dotnet:
-                if setup is None:
-                    raise Exception("setup required for libfuzzer_dotnet")
-                job = self.of.template.libfuzzer.dotnet(
-                    self.project,
-                    target,
-                    BUILD,
-                    pools[config.os].name,
-                    target_harness=config.target_exe,
-                    inputs=inputs,
-                    setup_dir=setup,
-                    duration=duration,
-                    vm_count=1,
-                    target_options=config.target_options,
-                )
-            elif config.template == TemplateType.libfuzzer_qemu_user:
-                job = self.of.template.libfuzzer.qemu_user(
-                    self.project,
-                    target,
-                    BUILD,
-                    pools[config.os].name,
-                    inputs=inputs,
-                    target_exe=target_exe,
-                    duration=duration,
-                    vm_count=1,
-                    target_options=config.target_options,
-                )
-            elif config.template == TemplateType.radamsa:
-                job = self.of.template.radamsa.basic(
-                    self.project,
-                    target,
-                    BUILD,
-                    pool_name=pools[config.os].name,
-                    target_exe=target_exe,
-                    inputs=inputs,
-                    setup_dir=setup,
-                    check_asan_log=config.check_asan_log or False,
-                    disable_check_debugger=config.disable_check_debugger or False,
-                    duration=duration,
-                    vm_count=1,
-                )
-            elif config.template == TemplateType.afl:
-                job = self.of.template.afl.basic(
-                    self.project,
-                    target,
-                    BUILD,
-                    pool_name=pools[config.os].name,
-                    target_exe=target_exe,
-                    inputs=inputs,
-                    setup_dir=setup,
-                    duration=duration,
-                    vm_count=1,
-                    target_options=config.target_options,
-                )
-            else:
-                raise NotImplementedError
+            def create_job() -> Optional[Job]:
+                if config.template == TemplateType.libfuzzer:
+                    job = self.of.template.libfuzzer.basic(
+                        self.project,
+                        target,
+                        self.build_id,
+                        pools[config.os].name,
+                        target_exe=target_exe,
+                        inputs=inputs,
+                        setup_dir=setup,
+                        duration=duration,
+                        vm_count=1,
+                        reboot_after_setup=config.reboot_after_setup or False,
+                        target_options=config.target_options,
+                        colocate_all_tasks=config.colocate_all_tasks,
+                    )
+                elif config.template == TemplateType.libfuzzer_dotnet:
+                    if setup is None:
+                        raise Exception("setup required for libfuzzer_dotnet")
+                    job = self.of.template.libfuzzer.dotnet(
+                        self.project,
+                        target,
+                        self.build_id,
+                        pools[config.os].name,
+                        target_harness=config.target_exe,
+                        inputs=inputs,
+                        setup_dir=setup,
+                        duration=duration,
+                        vm_count=1,
+                        target_options=config.target_options,
+                    )
+                elif config.template == TemplateType.libfuzzer_qemu_user:
+                    job = self.of.template.libfuzzer.qemu_user(
+                        self.project,
+                        target,
+                        self.build_id,
+                        pools[config.os].name,
+                        inputs=inputs,
+                        target_exe=target_exe,
+                        duration=duration,
+                        vm_count=1,
+                        target_options=config.target_options,
+                        colocate_all_tasks=config.colocate_all_tasks,
+                    )
+                elif config.template == TemplateType.radamsa:
+                    job = self.of.template.radamsa.basic(
+                        self.project,
+                        target,
+                        self.build_id,
+                        pool_name=pools[config.os].name,
+                        target_exe=target_exe,
+                        inputs=inputs,
+                        setup_dir=setup,
+                        check_asan_log=config.check_asan_log or False,
+                        disable_check_debugger=config.disable_check_debugger or False,
+                        duration=duration,
+                        vm_count=1,
+                    )
+                elif config.template == TemplateType.afl:
+                    job = self.of.template.afl.basic(
+                        self.project,
+                        target,
+                        self.build_id,
+                        pool_name=pools[config.os].name,
+                        target_exe=target_exe,
+                        inputs=inputs,
+                        setup_dir=setup,
+                        duration=duration,
+                        vm_count=1,
+                        target_options=config.target_options,
+                    )
+                else:
+                    job = None
+
+                return job
+
+            job = retry_on_500("creating job", lambda: create_job())
 
             if config.inject_fake_regression and job is not None:
-                self.of.debug.notification.job(job.job_id)
+                retry_on_500("debug notification", lambda: self.of.debug.notification.job(job.job_id))
 
             if not job:
                 raise Exception("missing job")
@@ -427,7 +461,7 @@ class TestOnefuzz:
                 )
                 return TaskTestState.failed
 
-        task = self.of.tasks.get(task.task_id)
+        task = retry_on_500("get task", lambda: self.of.tasks.get(task.task_id))
 
         # check if the task itself has an error
         if task.error is not None:
@@ -453,6 +487,7 @@ class TestOnefuzz:
         poll: bool = False,
         stop_on_complete_check: bool = False,
         job_ids: List[UUID] = [],
+        wait_for_upgrade: bool = False,
     ) -> bool:
         """Check all of the integration jobs"""
         jobs: Dict[UUID, Job] = {
@@ -468,16 +503,21 @@ class TestOnefuzz:
                 self.logger.error("unknown job target: %s", job.config.name)
                 continue
 
-            tasks = self.of.jobs.tasks.list(job.job_id)
+            tasks = retry_on_500("list tasks", lambda: self.of.jobs.tasks.list(job.job_id))
             job_tasks[job.job_id] = tasks
             check_containers[job.job_id] = {}
             for task in tasks:
                 for container in task.config.containers:
-                    if container.type in TARGETS[job.config.name].wait_for_files:
-                        count = TARGETS[job.config.name].wait_for_files[container.type]
+                    if wait_for_upgrade and TARGETS[job.config.name].wait_for_files_upgrade:
+                        wait_for = TARGETS[job.config.name].wait_for_files_upgrade
+                    else:
+                        wait_for = TARGETS[job.config.name].wait_for_files
+
+                    if container.type in wait_for:
+                        count = wait_for[container.type]
                         check_containers[job.job_id][container.name] = (
                             ContainerWrapper(
-                                self.of.containers.get(container.name).sas_url
+                                retry_on_500("get container sas url", lambda: self.of.containers.get(container.name).sas_url)
                             ),
                             count,
                         )
@@ -516,7 +556,7 @@ class TestOnefuzz:
                 for container_name in finished_containers:
                     del check_containers[job_id][container_name]
 
-            scalesets = self.of.scalesets.list()
+            scalesets = retry_on_500("scalesets list", lambda: self.of.scalesets.list())
             for job_id in job_tasks:
                 finished_tasks: Set[UUID] = set()
                 job_task_states[job_id] = set()
@@ -586,14 +626,15 @@ class TestOnefuzz:
             return (not bool(jobs), msg, self.success)
 
         if poll:
-            return wait(check_jobs_impl, frequency=self.polling_period)
+            return retry_on_500("checking jobs", lambda: wait(check_jobs_impl, frequency=self.polling_period))
         else:
             _, msg, result = check_jobs_impl()
             self.logger.info(msg)
             return result
 
     def get_job_crash_report(self, job_id: UUID) -> Optional[Tuple[Container, str]]:
-        for task in self.of.tasks.list(job_id=job_id, state=None):
+        tasks_list = retry_on_500("tasks list", lambda: self.of.tasks.list(job_id=job_id, state=None))
+        for task in tasks_list:
             for container in task.config.containers:
                 if container.type not in [
                     ContainerType.unique_reports,
@@ -601,7 +642,7 @@ class TestOnefuzz:
                 ]:
                     continue
 
-                files = self.of.containers.files.list(container.name)
+                files = retry_on_500("list container files", lambda: self.of.containers.files.list(container.name))
                 if len(files.files) > 0:
                     return (container.name, files.files[0])
         return None
@@ -645,7 +686,7 @@ class TestOnefuzz:
             else:
                 self.logger.info("launching repro: %s", job.config.name)
                 (container, path) = report
-                repro = self.of.repro.create(container, path, duration=1)
+                repro = retry_on_500("repro create", lambda: self.of.repro.create(container, path, duration=1))
                 repros[job.job_id] = (job, repro)
 
         return (result, repros)
@@ -670,7 +711,7 @@ class TestOnefuzz:
             }
 
             for (job, repro) in list(repros.values()):
-                repros[job.job_id] = (job, self.of.repro.get(repro.vm_id))
+                repros[job.job_id] = (job, retry_on_500("get repro", lambda: self.of.repro.get(repro.vm_id)))
 
             for (job, repro) in list(repros.values()):
                 if repro.error:
@@ -685,10 +726,12 @@ class TestOnefuzz:
                     # del repros[job.job_id]
                 elif repro.state == VmState.running:
                     try:
-                        result = self.of.repro.connect(
-                            repro.vm_id,
-                            delete_after_use=True,
-                            debug_command=commands[repro.os][0],
+                        result = retry_on_500("repro connect",
+                            lambda: self.of.repro.connect(
+                                repro.vm_id,
+                                delete_after_use=True,
+                                debug_command=commands[repro.os][0],
+                            )
                         )
                         if result is not None and re.search(
                             commands[repro.os][1], result, re.MULTILINE
@@ -731,21 +774,23 @@ class TestOnefuzz:
         return wait(check_repro_impl, frequency=self.polling_period)
 
     def get_jobs(self) -> List[Job]:
-        jobs = self.of.jobs.list(job_state=None)
+        jobs = retry_on_500("list jobs", lambda: self.of.jobs.list(job_state=None))
         jobs = [x for x in jobs if x.config.project == self.project]
         return jobs
 
     def stop_job(self, job: Job, delete_containers: bool = False) -> None:
-        self.of.template.stop(
-            job.config.project,
-            job.config.name,
-            BUILD,
-            delete_containers=delete_containers,
+        return retry_on_500("stop job", 
+            lambda: self.of.template.stop(
+                job.config.project,
+                job.config.name,
+                self.build_id,
+                delete_containers=delete_containers,
+            )
         )
 
     def get_pools(self) -> List[Pool]:
-        pools = self.of.pools.list()
-        pools = [x for x in pools if x.name == f"testpool-{x.os.name}-{self.test_id}"]
+        pools = retry_on_500("list pools", lambda: self.of.pools.list())
+        pools = [x for x in pools if x.name.startswith(f"testpool-{x.os.name}-{self.test_id}")]
         return pools
 
     def cleanup(self) -> None:
@@ -767,14 +812,15 @@ class TestOnefuzz:
                 "halting: %s:%s:%s", pool.name, pool.os.name, pool.arch.name
             )
             try:
-                self.of.pools.shutdown(pool.name, now=True)
+                retry_on_500("shutting down pools", lambda: self.of.pools.shutdown(pool.name, now=True))
             except Exception as e:
                 self.logger.error("cleanup of pool failed: %s - %s", pool.name, e)
                 errors.append(e)
 
         container_names = set()
         for job in jobs:
-            for task in self.of.tasks.list(job_id=job.job_id, state=None):
+            tasks_list = retry_on_500("list tasks", lambda: self.of.tasks.list(job_id=job.job_id, state=None))
+            for task in tasks_list:
                 for container in task.config.containers:
                     if container.type in [
                         ContainerType.reports,
@@ -782,10 +828,11 @@ class TestOnefuzz:
                     ]:
                         container_names.add(container.name)
 
-        for repro in self.of.repro.list():
+        repro_list = retry_on_500("list repro", lambda: self.of.repro.list())
+        for repro in repro_list:
             if repro.config.container in container_names:
                 try:
-                    self.of.repro.delete(repro.vm_id)
+                    retry_on_500("delte repro", lambda: self.of.repro.delete(repro.vm_id))
                 except Exception as e:
                     self.logger.error("cleanup of repro failed: %s %s", repro.vm_id, e)
                     errors.append(e)
@@ -799,7 +846,7 @@ class TestOnefuzz:
         #
         # https://apmtips.com/posts/2017-10-27-send-metric-to-application-insights/
 
-        key = self.of.info.get().insights_instrumentation_key
+        key = retry_on_500("info get", lambda: self.of.info.get().insights_instrumentation_key)
         assert key is not None, "instrumentation key required for integration testing"
 
         data = {
@@ -825,8 +872,11 @@ class TestOnefuzz:
     def check_log_end_marker(
         self,
     ) -> Tuple[bool, str, bool]:
-        logs = self.of.debug.logs.keyword(
-            self.stop_log_marker, limit=1, timespan="PT1H"
+        logs = retry_on_500("debug logs",
+            lambda:
+                self.of.debug.logs.keyword(
+                    self.stop_log_marker, limit=1, timespan="PT1H"
+                )
         )
         return (
             len(logs) > 0,
@@ -840,11 +890,10 @@ class TestOnefuzz:
         # hours. The records are scanned through in reverse chronological
         # order.
 
-        self.inject_log(self.stop_log_marker)
         wait(self.check_log_end_marker, frequency=self.polling_period)
         self.logger.info("application insights log flushed")
 
-        logs = self.of.debug.logs.keyword("error", limit=100000, timespan="PT3H")
+        logs = retry_on_500("get error logs", lambda: self.of.debug.logs.keyword("error", limit=100000, timespan="PT3H"))
 
         seen_errors = False
         seen_stop = False
@@ -892,11 +941,19 @@ class TestOnefuzz:
             if (
                 "storage queue pop failed" in message
                 or "storage queue delete failed" in message
+                or "request did not succeed: HTTP 500" in message
             ) and entry.get("sdkVersion") == "rust:0.1.5":
                 continue
 
+            if (
+                "A host error has occurred during startup operation" in message
+                or "An unhandled exception has occurred. Host is shutting down." in message
+            ):
+                continue
+
             if message is None:
-                self.logger.error("error log: %s", entry)
+                if entry:
+                    self.logger.error("error log: %s", entry)
             else:
                 self.logger.error("error log: %s", message)
             seen_errors = True
@@ -1103,10 +1160,16 @@ class Run(Command):
         targets: List[str] = list(TARGETS.keys()),
         skip_repro: bool = False,
         duration: int = 1,
+        test_id: Optional[UUID] = None,
+        build_id: str = "0",
+        check_results: bool = False,
+        is_first_run: bool = False,
     ) -> None:
         success = True
 
-        test_id = uuid4()
+        if test_id is None:
+            test_id = uuid4()
+
         error: Optional[Exception] = None
         try:
 
@@ -1119,21 +1182,31 @@ class Run(Command):
                 )
 
             retry(try_setup, "trying to configure")
-            tester = TestOnefuzz(self.onefuzz, self.logger, test_id)
+            tester = TestOnefuzz(self.onefuzz, self.logger, test_id, build_id)
+
+            if is_first_run:
+                tester.inject_start_log_marker()
+
             tester.setup(region=region, pool_size=pool_size, os_list=os_list)
             tester.launch(samples, os_list=os_list, targets=targets, duration=duration)
-            result = tester.check_jobs(poll=True, stop_on_complete_check=True)
-            if not result:
-                raise Exception("jobs failed")
-            if skip_repro:
-                self.logger.warning("not testing crash repro")
-            else:
-                launch_result, repros = tester.launch_repro()
-                result = tester.check_repro(repros)
-                if not (result and launch_result):
-                    raise Exception("repros failed")
 
-            tester.check_logs_for_errors()
+            if check_results:
+                result = tester.check_jobs(poll=True, stop_on_complete_check=True, wait_for_upgrade=True)
+                if not result:
+                    raise Exception("jobs failed")
+                if skip_repro:
+                    self.logger.warning("not testing crash repro")
+                else:
+                    launch_result, repros = tester.launch_repro()
+                    result = tester.check_repro(repros)
+                    if not (result and launch_result):
+                        raise Exception("repros failed")
+
+                tester.inject_stop_log_marker()
+                tester.check_logs_for_errors()
+            else:
+                # retry_on_500("checking jobs", lambda: tester.check_jobs(poll=False, stop_on_complete_check=False, wait_for_upgrade=False))
+                pass
 
         except Exception as e:
             self.logger.error("testing failed: %s", repr(e))
@@ -1143,18 +1216,19 @@ class Run(Command):
             self.logger.error("interrupted testing")
             success = False
 
-        try:
-            self.cleanup(
-                test_id,
-                endpoint=endpoint,
-                client_id=client_id,
-                client_secret=client_secret,
-                authority=authority,
-            )
-        except Exception as e:
-            self.logger.error("testing failed: %s", repr(e))
-            error = e
-            success = False
+        if check_results:
+            try:
+                self.cleanup(
+                    test_id,
+                    endpoint=endpoint,
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    authority=authority,
+                )
+            except Exception as e:
+                self.logger.error("testing failed: %s", repr(e))
+                error = e
+                success = False
 
         if error:
             try:

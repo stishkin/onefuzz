@@ -8,12 +8,11 @@ import os
 import subprocess
 import tempfile
 import time
-import uuid
 from typing import List, Optional
+from uuid import UUID, uuid4
 
 from cleanup_ad import delete_current_user_app_registrations
-
-from .github_client import GithubClient
+from github_client import GithubClient
 
 
 def venv_path(base: str, name: str) -> str:
@@ -40,6 +39,10 @@ class Deployer:
         test_args: List[str],
         repo: str,
         unattended: bool,
+        repo_upgrade_from: str,
+        branch_upgrade_from: str,
+        pr_upgrade_from: int,
+        skip_upgrade_test: bool,
     ):
         self.downloader = GithubClient()
         self.pr = pr
@@ -54,6 +57,10 @@ class Deployer:
         self.client_id: Optional[str] = None
         self.client_secret: Optional[str] = None
         self.authority = authority
+        self.repo_upgrade_from = repo_upgrade_from
+        self.branch_upgrade_from = branch_upgrade_from
+        self.pr_upgrade_from = pr_upgrade_from
+        self.skip_upgrade_test = skip_upgrade_test
 
     def merge(self) -> None:
         if self.pr:
@@ -72,7 +79,11 @@ class Deployer:
             ("installing wheel", f"{pip} install -q wheel"),
             ("installing prereqs", f"{pip} install -q -r requirements.txt"),
             (
-                "running deploment",
+                "replace deploy",
+                "cp -f /mnt/c/Users/statis/Documents/repos/onefuzz/onefuzz/src/utils/check-pr/deploy.py .",
+            ),
+            (
+                "running deployment",
                 (
                     f"{py} deploy.py {self.region} "
                     f"{self.instance} {self.instance} cicd {config}"
@@ -129,7 +140,15 @@ class Deployer:
         time.sleep(30)
         return
 
-    def test(self, filename: str) -> None:
+    def test(
+        self,
+        test_id: UUID,
+        build_id: str,
+        check_results: bool,
+        is_first_run: bool,
+        filename: str,
+        region: str,
+    ) -> None:
         venv = "test-venv"
         subprocess.check_call(f"python -mvenv {venv}", shell=True)
         py = venv_path(venv, "python")
@@ -143,25 +162,40 @@ class Deployer:
             else ""
         )
         authority_args = f"--authority {self.authority}" if self.authority else ""
+        is_first_run_args = "--is_first_run" if is_first_run else ""
+        check_results_args = "--check_results" if check_results else ""
+
+        # targets = "--targets linux-libfuzzer windows-libfuzzer"
+        targets = "--targets windows-onefuzz-sample"
 
         commands = [
             (
                 "extracting integration-test-artifacts",
-                f"unzip -qq {filename} -d {test_dir}",
+                f"unzip -qq -o {filename} -d {test_dir}",
             ),
             ("test venv", f"python -mvenv {venv}"),
             ("installing wheel", f"./{venv}/bin/pip install -q wheel"),
-            ("installing sdk", f"./{venv}/bin/pip install -q sdk/*.whl"),
+            ("installing sdk", f"./{venv}/bin/pip install -q {build_id}/sdk/*.whl"),
+            (
+                "copy sample",
+                f"cp -r /mnt/c/Users/statis/Documents/repos/onefuzz/onefuzz/src/integration-tests/windows-onefuzz-sample {test_dir}",
+            ),
             (
                 "running integration",
                 (
-                    f"{py} {test_dir}/{script} test {test_dir} "
-                    f"--region {self.region} --endpoint {endpoint} "
+                    # f"{py} {test_dir}/{script} test {test_dir} "
+                    f"{py} /mnt/c/Users/statis/Documents/repos/onefuzz/onefuzz/src/integration-tests/{script} test {test_dir} "
+                    f"--region {region} --endpoint {endpoint} "
+                    f"--test_id {test_id} --build_id {build_id} "
+                    f"{check_results_args} "
+                    f"{is_first_run_args} "
+                    f"{targets} "
                     f"{authority_args} "
                     f"{unattended_args} {test_args}"
                 ),
             ),
         ]
+
         for (msg, cmd) in commands:
             print(msg)
             print(cmd)
@@ -180,6 +214,40 @@ class Deployer:
         print("done")
 
     def run(self, *, merge_on_success: bool = False) -> None:
+        cwd = os.getcwd()
+
+        test_id = uuid4()
+        test_filename = "integration-test-artifacts.zip"
+        if not self.skip_tests:
+            self.downloader.get_artifact(
+                self.repo,
+                "ci.yml",
+                self.branch,
+                self.pr,
+                "integration-test-artifacts",
+                test_filename,
+            )
+
+        if not self.skip_upgrade_test:
+            print(
+                f"pre-upgrade deploying from {self.repo_upgrade_from}/{self.branch_upgrade_from}"
+            )
+            os.mkdir("0")
+            os.chdir("0")
+            release_filename = "release-artifacts-0.zip"
+            self.downloader.get_artifact(
+                self.repo_upgrade_from,
+                "ci.yml",
+                self.branch_upgrade_from,
+                self.pr_upgrade_from,
+                "release-artifacts",
+                release_filename,
+            )
+            self.deploy(release_filename)
+            os.chdir(cwd)
+
+        os.mkdir("1")
+        os.chdir("1")
         release_filename = "release-artifacts.zip"
         self.downloader.get_artifact(
             self.repo,
@@ -189,21 +257,26 @@ class Deployer:
             "release-artifacts",
             release_filename,
         )
-
-        test_filename = "integration-test-artifacts.zip"
-        self.downloader.get_artifact(
-            self.repo,
-            "ci.yml",
-            self.branch,
-            self.pr,
-            "integration-test-artifacts",
-            test_filename,
-        )
-
+        if self.skip_upgrade_test:
+            print(f"deploying from {self.repo}/[branch:{self.branch}][pr:{self.pr}]")
+        else:
+            if not self.skip_tests:
+                print("pre-upgrade starting tests")
+                os.chdir(cwd)
+                self.test(test_id, "0", False, True, test_filename, self.region)
+                os.chdir("1")
+            print(f"upgrading from {self.repo}/[branch:{self.branch}][pr:{self.pr}]")
         self.deploy(release_filename)
+        os.chdir(cwd)
 
         if not self.skip_tests:
-            self.test(test_filename)
+            if self.skip_upgrade_test:
+                print("running tests")
+            else:
+                print("running post-upgrade tests")
+            self.test(
+                test_id, "1", True, self.skip_upgrade_test, test_filename, self.region
+            )
 
         if merge_on_success:
             self.merge()
@@ -219,7 +292,7 @@ def main() -> None:
     # which we strip out.
     name = name.strip()
 
-    default_instance = f"pr-check-{name}-%s" % uuid.uuid4().hex
+    default_instance = f"pr-check-{name}-%s" % uuid4().hex
     parser = argparse.ArgumentParser()
     parser.add_argument("--instance", default=default_instance)
     group = parser.add_mutually_exclusive_group()
@@ -234,12 +307,29 @@ def main() -> None:
     parser.add_argument("--merge-on-success", action="store_true")
     parser.add_argument("--subscription_id")
     parser.add_argument("--authority", default=None)
-    parser.add_argument("--test_args", nargs=argparse.REMAINDER)
     parser.add_argument("--unattended", action="store_true")
+
+    parser.add_argument("--skip-upgrade-test", action="store_true")
+    parser.add_argument("--branch-upgrade-from", default="main")
+    parser.add_argument("--pr-upgrade-from", type=int)
+    parser.add_argument("--repo-upgrade-from", default="microsoft/onefuzz")
+    parser.add_argument("--test-region2", default="southcentralus")
+
+    parser.add_argument("--test_args", nargs=argparse.REMAINDER)
+
     args = parser.parse_args()
 
     if not args.branch and not args.pr:
         raise Exception("--branch or --pr is required")
+
+    if (
+        not args.branch_upgrade_from
+        and not args.pr_upgrade_from
+        and not args.skip_upgrade_test
+    ):
+        raise Exception(
+            "--branch_upgrade_from or --pr_updgrade_from is required when doing upgraded test"
+        )
 
     d = Deployer(
         branch=args.branch,
@@ -252,6 +342,10 @@ def main() -> None:
         repo=args.repo,
         unattended=args.unattended,
         authority=args.authority,
+        repo_upgrade_from=args.repo_upgrade_from,
+        branch_upgrade_from=args.branch_upgrade_from,
+        pr_upgrade_from=args.pr_upgrade_from,
+        skip_upgrade_test=args.skip_upgrade_test,
     )
     with tempfile.TemporaryDirectory() as directory:
         os.chdir(directory)
@@ -259,9 +353,11 @@ def main() -> None:
 
         try:
             d.run(merge_on_success=args.merge_on_success)
+            input("press any key")
             d.cleanup(args.skip_cleanup)
             return
         finally:
+            input("press any key")
             if not args.skip_cleanup_on_failure:
                 d.cleanup(args.skip_cleanup)
         os.chdir(tempfile.gettempdir())
